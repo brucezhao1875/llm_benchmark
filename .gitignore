@@ -1,0 +1,20 @@
+# Local agent/runtime files
+.codex
+
+# Editor swap files
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+
+# Large raw benchmark artifacts should be stored externally and referenced from reports
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Local/non-benchmark working material
+/docs/superpowers/
+/archive/misc/
