@@ -9,8 +9,8 @@
 
 1. `32K` 启动配置成功，`/v1/models` ready 用时 `220s`。
 2. `32K` 配置完成了短请求矩阵和 32K 边界探针，所有测试点成功。
-3. `1M` 启动配置在 `30 分钟 ready 等待窗口` 内没有 ready，记录为 `1m_start_failed`；因此本轮没有执行 1M 短请求退化测试和 1M 能力探针。
-4. `1M` 不是简单把 `--max-model-len` 改成 `1048576` 就可以稳定上线；它至少需要单独启动策略、更长 ready 窗口、额外参数调优和独立服务池。
+3. `1M` 启动配置在 `30 分钟 ready 等待窗口` 内没有 ready，记录为 `1m_start_failed`；后续复测官方缺省 H20/H200 配方也失败。
+4. 官方缺省配方不写 `--max-model-len` 时，vLLM 会从模型配置解析出 `1048576`，并在 H20 上因 KV cache 不足失败。
 5. `32K` 对普通短请求表现稳定，适合作为低延迟在线池候选。
 6. 当前服务已恢复到测试前配置：非 MTP baseline，`max-model-len=262144`。
 7. Gateway 必须支持 token-aware routing：普通请求走短上下文池，长上下文走 256K/1M 专用池，1M 请求默认不应进入普通在线同步池。
@@ -44,6 +44,7 @@
 | 32K | 32768 | 成功 | 220s | 完成全部测试 |
 | 256K | 262144 | 历史已成功 | 历史数据 | 当前已恢复到该配置 |
 | 1M | 1048576 | 未 ready | >1800s | 30 分钟窗口内 API 未 ready，停止后续测试 |
+| 官方缺省 H20/H200 配方 | 1048576 | 失败 | 约 170s 后退出 | 未显式设置 `--max-model-len`，vLLM 从 config 读取 1M |
 
 1M 阶段日志要点：
 
@@ -222,7 +223,7 @@ vllm:kv_cache_usage_perc ≈ 0.0172
 3. 如果目标是低延迟流式体验，32K baseline 是更稳的在线池候选。
 4. 如果目标是最大化吞吐，MTP 仍值得作为高吞吐池候选。
 
-## 9. 1M 测试结论
+## 9. 1M 和官方缺省配方测试结论
 
 本轮未获得 1M 请求性能数据，因为 1M 服务没有在 30 分钟内 ready。
 
@@ -249,6 +250,130 @@ vllm:kv_cache_usage_perc ≈ 0.0172
 4. 如果 ready 成功，再跑 384K/1 output。
 5. 如果 384K 成功，再逐级跑 512K、768K、1M。
 ```
+
+### 9.1 官方缺省 H20/H200 配方复测
+
+复测时间：2026-06-30  
+远端结果目录：
+
+```text
+/data/bench/glm52/20260630-084852-default-recipe-startup-test-with-path
+```
+
+测试命令：
+
+```bash
+PATH=/data/venvs/glm52/bin:$PATH /data/venvs/glm52/bin/vllm serve /data/models/GLM-5.2-FP8-ms \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --speculative-config.method mtp \
+  --speculative-config.num_speculative_tokens 5 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --enable-auto-tool-choice \
+  --served-model-name glm-5.2-fp8
+```
+
+说明：这里用本地模型路径替代 `zai-org/GLM-5.2-FP8`，避免重新下载；测试重点是官方配方没有显式传 `--max-model-len`。
+
+测试结果：
+
+| 项目 | 结果 |
+|---|---|
+| 是否 ready | 否 |
+| 退出时间 | 约 170s |
+| vLLM 解析出的上下文 | `1048576` |
+| 1M 所需 KV cache | `60.79 GiB` / GPU |
+| 当前可用 KV cache | `22.87 GiB` / GPU |
+| vLLM 估算最大可承载长度 | `394496` tokens |
+| 原 262K 服务恢复 | 成功，约 240s ready |
+
+关键日志：
+
+```text
+Using max model len 1048576
+Available KV cache memory: 22.87 GiB
+ValueError: To serve at least one request with the model's max seq len (1048576),
+60.79 GiB KV cache is needed, larger than available 22.87 GiB.
+Based on the available memory, the estimated maximum model length is 394496.
+```
+
+结论：
+
+```text
+H20/H200 standard FP8 配方可以表达“用 FP8 运行 GLM-5.2-FP8”，
+但在 H20 上不能省略 max-model-len。
+否则 vLLM 会按模型原生 1M 上下文启动，最终因 KV cache 不足失败。
+```
+
+因此 H20 生产启动命令必须显式设置：
+
+```bash
+--max-model-len 262144
+```
+
+如果要探索 H20 的上限，应使用独立实验池从 `384K` 或 `393216` 这类长度开始，而不是直接使用缺省 1M。
+
+### 9.2 每个 token 的 KV cache 显存占用
+
+根据 vLLM 实测错误：
+
+```text
+60.79 GiB / 1,048,576 tokens = 60.79 KiB/token/GPU
+```
+
+也就是：
+
+```text
+约 62,249 bytes/token/GPU
+```
+
+这是每张 GPU 上的 KV cache 成本，不是 8 卡合计成本。8 卡总预留量还要乘以 8，但真正启动失败的约束是每张卡自己的可用 KV cache 是否足够。
+
+从 GLM-5.2 的 MLA/DSA 结构做一个下界估算：
+
+```text
+num_hidden_layers = 78
+kv_lora_rank = 512
+qk_rope_head_dim = 64
+kv_cache_dtype = fp8 = 1 byte/element
+
+raw MLA KV payload
+= 78 * (512 + 64) * 1
+= 44,928 bytes/token/GPU
+= 43.875 KiB/token/GPU
+```
+
+vLLM 实际规划值比 raw payload 大：
+
+```text
+60.79 / 43.875 = 约 1.39 倍
+```
+
+差异来自具体运行时实现，包括 `fp8_ds_mla` / DSA KV 格式、block/page 分配、alignment、scale/metadata、CUDA graph/profile 相关保留等。因此：
+
+```text
+raw 公式用于理解数量级；
+生产容量规划必须以 vLLM 启动日志为准。
+```
+
+按 vLLM 这次实测成本估算：
+
+| 上下文长度 | 每 GPU KV cache 需求 |
+|---:|---:|
+| 262,144 | `15.20 GiB` |
+| 394,496 | `22.87 GiB` |
+| 1,048,576 | `60.79 GiB` |
+
+恢复后的 262K 服务日志显示：
+
+```text
+Available KV cache memory: 28.74 GiB
+GPU KV cache size: 502,016 tokens
+Maximum concurrency for 262,144 tokens per request: 1.92x
+```
+
+这说明 262K 的服务配置有足够 KV 空间，而 1M 在当前 H20 上没有。
 
 ## 10. 对 Gateway 的要求
 

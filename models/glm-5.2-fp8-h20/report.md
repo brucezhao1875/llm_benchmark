@@ -15,7 +15,7 @@ The most important conclusions are:
 1. The meaningful serving capacity metric is `tokens/s`, especially `output tokens/s`, not isolated QPS.
 2. A 32K startup context is suitable as a low-latency online pool candidate.
 3. A 256K startup context is usable as a standard long-context / Agent / RAG pool.
-4. A 1M startup context did not become ready within the 30-minute test window using the initial vLLM configuration, so 1M should be treated as an experimental ultra-long pool, not a default production setting.
+4. A 1M startup context is not viable on this 8 x H20 node with the current vLLM/GLM-5.2-FP8 configuration: the official-style default recipe resolves `max_model_len=1048576` and fails because required KV cache is larger than available H20 KV cache memory.
 5. MTP/speculative decoding improves output throughput in several decode scenarios, but can worsen ITL, so it should be used selectively for high-throughput or non-strict-streaming pools.
 6. A production gateway must be token-aware and route requests by input length, requested output length, SLA, user tier, and backend pool load.
 
@@ -133,7 +133,7 @@ Interpretation:
 2. MTP often worsens ITL p95, so streaming smoothness may degrade.
 3. MTP is better suited for high-throughput or batch-like pools than for all low-latency streaming traffic.
 
-### 4.3 1M startup context
+### 4.3 1M startup context and official default recipe
 
 The initial 1M startup test used:
 
@@ -149,11 +149,112 @@ Result:
 
 The service process entered loading/compile/warmup states, but `/v1/models` did not become ready within the configured 30-minute window.
 
+Follow-up default recipe test:
+
+```bash
+PATH=/data/venvs/glm52/bin:$PATH /data/venvs/glm52/bin/vllm serve /data/models/GLM-5.2-FP8-ms \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --speculative-config.method mtp \
+  --speculative-config.num_speculative_tokens 5 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --enable-auto-tool-choice \
+  --served-model-name glm-5.2-fp8
+```
+
+This is the vLLM H20/H200 recipe shape, with the local model path replacing the Hugging Face model name to avoid re-downloading weights. The important point is that it does not set `--max-model-len`.
+
+Result directory:
+
+```text
+/data/bench/glm52/20260630-084852-default-recipe-startup-test-with-path
+```
+
+Result:
+
+| Test | Result |
+|---|---|
+| Default recipe without `--max-model-len` | failed before ready |
+| Time to failure | about 170s |
+| vLLM resolved max length | `1048576` |
+| Required KV cache for 1M | `60.79 GiB` per GPU |
+| Available KV cache | `22.87 GiB` per GPU |
+| vLLM estimated maximum model length | `394496` tokens |
+| Restore result | original 262K service restored and ready after about 240s |
+
+Key log excerpt:
+
+```text
+Using max model len 1048576
+Available KV cache memory: 22.87 GiB
+ValueError: To serve at least one request with the model's max seq len (1048576),
+60.79 GiB KV cache is needed, larger than available 22.87 GiB.
+Based on the available memory, the estimated maximum model length is 394496.
+```
+
 Interpretation:
 
-1. This does not prove GLM-5.2-FP8 can never run 1M on this hardware.
-2. It proves the initial naive 1M vLLM service configuration is not production-ready.
-3. 1M requires a separate experiment with longer startup observation, stricter admission control, likely parameter tuning, and a dedicated ultra-long service pool.
+1. The default recipe does not automatically downshift to a H20-safe context length.
+2. Without `--max-model-len`, vLLM reads the model config and uses GLM-5.2-FP8's native `1048576` context.
+3. On this 8 x H20 node, that fails at KV cache planning.
+4. Production H20 deployment must explicitly set `--max-model-len`, currently `262144` for the stable pool.
+
+### 4.4 KV cache sizing for GLM-5.2-FP8 on H20
+
+The vLLM failure gives an empirical KV cache cost:
+
+```text
+60.79 GiB / 1,048,576 tokens = 60.79 KiB per token per GPU
+```
+
+Equivalently:
+
+```text
+60.79 KiB/token/GPU = about 62,249 bytes/token/GPU
+```
+
+This is a per-GPU figure. Across 8 GPUs, the cluster-level reservation would be roughly 8 times larger, but the startup constraint is per GPU because each tensor-parallel worker must fit its own KV cache allocation.
+
+The model-structure lower-bound estimate is smaller:
+
+```text
+num_hidden_layers = 78
+kv_lora_rank = 512
+qk_rope_head_dim = 64
+kv_cache_dtype = fp8 = 1 byte/element
+
+raw MLA payload per token per GPU
+= 78 * (512 + 64) * 1 byte
+= 44,928 bytes
+= 43.875 KiB/token/GPU
+```
+
+vLLM's actual planner reports about:
+
+```text
+60.79 / 43.875 = 1.39x
+```
+
+above the raw MLA payload. The gap comes from the concrete vLLM `fp8_ds_mla` / DSA implementation, block/page allocation, alignment, scaling/metadata, and runtime-reserved memory. Therefore the raw formula is useful for order-of-magnitude reasoning, but capacity planning should use vLLM startup logs.
+
+Practical implications:
+
+| Context length | Approx. KV needed per GPU, using vLLM observed cost |
+|---:|---:|
+| 262,144 | `15.20 GiB` |
+| 394,496 | `22.87 GiB` |
+| 1,048,576 | `60.79 GiB` |
+
+The restored 262K service reported:
+
+```text
+Available KV cache memory: 28.74 GiB
+GPU KV cache size: 502,016 tokens
+Maximum concurrency for 262,144 tokens per request: 1.92x
+```
+
+This explains why 262K is stable while 1M is not.
 
 ## 5. Cost and QPS interpretation
 
